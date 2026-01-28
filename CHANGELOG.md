@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.5] - 2026-01-28
+
+### Bug Fixes
+- Fixed potential division by zero in audit.go when no rows are checked
+
 ## [1.0.4] - 2026-01-28
 
 ### Security

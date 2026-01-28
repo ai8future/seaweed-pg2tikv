@@ -449,10 +449,14 @@ func main() {
 	log.Printf("Mode: %s", *mode)
 	log.Printf("Postgres rows: %d", totalRows)
 	log.Printf("Rows checked: %d", finalChecked)
-	log.Printf("Found in TiKV: %d (%.2f%%)", finalFound, float64(finalFound)/float64(finalChecked)*100)
-	log.Printf("Matched exactly: %d (%.2f%%)", finalMatched, float64(finalMatched)/float64(finalChecked)*100)
-	log.Printf("Missing from TiKV: %d (%.2f%%)", finalMissing, float64(finalMissing)/float64(finalChecked)*100)
-	log.Printf("Mismatched data: %d (%.2f%%)", finalMismatched, float64(finalMismatched)/float64(finalChecked)*100)
+	if finalChecked > 0 {
+		log.Printf("Found in TiKV: %d (%.2f%%)", finalFound, float64(finalFound)/float64(finalChecked)*100)
+		log.Printf("Matched exactly: %d (%.2f%%)", finalMatched, float64(finalMatched)/float64(finalChecked)*100)
+		log.Printf("Missing from TiKV: %d (%.2f%%)", finalMissing, float64(finalMissing)/float64(finalChecked)*100)
+		log.Printf("Mismatched data: %d (%.2f%%)", finalMismatched, float64(finalMismatched)/float64(finalChecked)*100)
+	} else {
+		log.Printf("No rows checked - nothing to report")
+	}
 	log.Printf("Time: %v", elapsed.Round(time.Second))
 	log.Printf("seaweed-pg2tikv-audit version %s", Version)
 
