@@ -1,0 +1,47 @@
+# Secrets
+.env
+.env.local
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+.venv/
+venv/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+
+# PHP
+/vendor
+
+# Go
+*.exe
+*.test
+.gocache/
+
+# Node
+node_modules/
+dist/
+
+# IDE/Editor
+.idea/
+/.idea
+.vscode/
+*.swp
+*.swo
+
+# Claude
+.claude/settings.local.json
+
+# Build artifacts (project-specific)
+seaweed-pg2tikv-linux-amd64
+seaweed-pg2tikv-audit-linux-amd64
+seaweed-count-keys-linux-amd64
