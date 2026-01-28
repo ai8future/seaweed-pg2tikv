@@ -1,5 +1,5 @@
 // seaweed-pg2tikv - Migrate SeaweedFS filer metadata from Postgres to TiKV
-// Version 1.0.3
+// Version 1.0.4
 package main
 
 import (
@@ -13,9 +13,9 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -25,9 +25,12 @@ import (
 	"github.com/tikv/client-go/v2/txnkv"
 )
 
-const Version = "1.0.3"
+const Version = "1.0.4"
 
 const MinInt64 = -9223372036854775808
+
+// validTableName validates that a table name contains only safe characters
+var validTableName = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_\-]*$`)
 
 // ========== Config Structures ==========
 
@@ -102,6 +105,8 @@ var (
 	partitionID    = flag.Int("partition-id", 0, "This instance's partition (0 to mod-1)")
 	dryRun         = flag.Bool("dry-run", false, "Parse configs and exit without migrating")
 	showVersion    = flag.Bool("version", false, "Show version and exit")
+	maxRetries     = flag.Int("max-retries", 15, "Maximum retries per batch")
+	retryBaseMs    = flag.Int("retry-base-ms", 500, "Base retry delay in milliseconds")
 )
 
 // ========== State Management ==========
@@ -114,31 +119,44 @@ type State struct {
 	StartedAt     string `json:"started_at"`
 }
 
-func loadState(filename string) *State {
+func loadState(filename string) (*State, error) {
 	data, err := os.ReadFile(filename)
 	if err != nil {
-		// Start from minimum int64 to include negative dirhash values
-		return &State{
-			StartedAt:   time.Now().UTC().Format(time.RFC3339),
-			LastDirhash: MinInt64,
-			LastName:    "",
+		if os.IsNotExist(err) {
+			// Start from minimum int64 to include negative dirhash values
+			return &State{
+				StartedAt:   time.Now().UTC().Format(time.RFC3339),
+				LastDirhash: MinInt64,
+				LastName:    "",
+			}, nil
 		}
+		return nil, fmt.Errorf("failed to read state file: %w", err)
 	}
 	var state State
-	json.Unmarshal(data, &state)
+	if err := json.Unmarshal(data, &state); err != nil {
+		return nil, fmt.Errorf("failed to parse state file: %w", err)
+	}
 	// Handle old state files that started from 0
 	if state.LastDirhash == 0 && state.LastName == "" && state.TotalMigrated == 0 {
 		state.LastDirhash = MinInt64
 	}
-	return &state
+	return &state, nil
 }
 
-func saveState(filename string, state *State) {
-	data, _ := json.MarshalIndent(state, "", "  ")
-	os.WriteFile(filename, data, 0644)
+func saveState(filename string, state *State) error {
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal state: %w", err)
+	}
+	if err := os.WriteFile(filename, data, 0644); err != nil {
+		return fmt.Errorf("failed to write state file: %w", err)
+	}
+	return nil
 }
 
 // ========== TiKV Key Generation ==========
+// Note: SHA1 is required here to match SeaweedFS filer's key generation.
+// This is not for cryptographic security, just consistent key derivation.
 
 func hashToBytes(dir string) []byte {
 	h := sha1.New()
@@ -167,17 +185,29 @@ type Entry struct {
 	Meta      []byte
 }
 
-func commitBatch(ctx context.Context, tikvClient *txnkv.Client, prefix []byte, enable1PC bool, batch []Entry, workerID int) error {
-	const maxRetries = 15
+// Batch wraps entries with a sequence number for ordered progress tracking
+type Batch struct {
+	SeqNum  int64
+	Entries []Entry
+}
 
-	for retry := 0; retry < maxRetries; retry++ {
+// BatchResult reports the outcome of processing a batch
+type BatchResult struct {
+	SeqNum    int64
+	LastEntry Entry
+	Success   bool
+	Count     int
+}
+
+func commitBatch(ctx context.Context, tikvClient *txnkv.Client, prefix []byte, enable1PC bool, batch []Entry, workerID int, maxRetryCount int, retryBaseDelayMs int) error {
+	for retry := 0; retry < maxRetryCount; retry++ {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 
 		txn, err := tikvClient.Begin()
 		if err != nil {
-			log.Printf("[worker-%02d] begin txn error (attempt %d/%d): %v", workerID, retry+1, maxRetries, err)
+			log.Printf("[worker-%02d] begin txn error (attempt %d/%d): %v", workerID, retry+1, maxRetryCount, err)
 			time.Sleep(time.Duration(retry+1) * 200 * time.Millisecond)
 			continue
 		}
@@ -186,27 +216,43 @@ func commitBatch(ctx context.Context, tikvClient *txnkv.Client, prefix []byte, e
 			txn.SetEnable1PC(true)
 		}
 
+		// Set all entries, fail batch on any error
+		var setErr error
 		for _, e := range batch {
 			key := generateTiKVKey(prefix, e.Directory, e.Name)
 			if err := txn.Set(key, e.Meta); err != nil {
 				log.Printf("[worker-%02d] set error %s/%s: %v", workerID, e.Directory, e.Name, err)
+				setErr = err
+				break
 			}
 		}
 
-		err = txn.Commit(context.Background())
+		if setErr != nil {
+			txn.Rollback()
+			backoff := time.Duration(retry+1) * time.Duration(retryBaseDelayMs) * time.Millisecond
+			if retry < maxRetryCount-1 {
+				log.Printf("[worker-%02d] RETRY %d/%d after set error (backoff %v): %v", workerID, retry+1, maxRetryCount, backoff, setErr)
+				time.Sleep(backoff)
+				continue
+			}
+			return setErr
+		}
+
+		// Use the provided context for commit to respect cancellation
+		err = txn.Commit(ctx)
 		if err == nil {
 			return nil // Success!
 		}
 
 		txn.Rollback()
 
-		// Exponential backoff with jitter
-		backoff := time.Duration(retry+1) * 500 * time.Millisecond
-		if retry < maxRetries-1 {
-			log.Printf("[worker-%02d] RETRY %d/%d (backoff %v): %v", workerID, retry+1, maxRetries, backoff, err)
+		// Exponential backoff
+		backoff := time.Duration(retry+1) * time.Duration(retryBaseDelayMs) * time.Millisecond
+		if retry < maxRetryCount-1 {
+			log.Printf("[worker-%02d] RETRY %d/%d (backoff %v): %v", workerID, retry+1, maxRetryCount, backoff, err)
 			time.Sleep(backoff)
 		} else {
-			log.Printf("[worker-%02d] FAILED after %d attempts: %v", workerID, maxRetries, err)
+			log.Printf("[worker-%02d] FAILED after %d attempts: %v", workerID, maxRetryCount, err)
 			return err
 		}
 	}
@@ -215,31 +261,104 @@ func commitBatch(ctx context.Context, tikvClient *txnkv.Client, prefix []byte, e
 }
 
 func worker(ctx context.Context, id int, tikvClient *txnkv.Client, prefix []byte, enable1PC bool,
-	entries <-chan []Entry, successCounter *int64, failCounter *int64, lastEntry *Entry, mu *sync.Mutex, wg *sync.WaitGroup) {
+	batches <-chan Batch, results chan<- BatchResult, maxRetryCount int, retryBaseDelayMs int, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	for batch := range entries {
+	for batch := range batches {
 		if ctx.Err() != nil {
 			return
 		}
 
-		err := commitBatch(ctx, tikvClient, prefix, enable1PC, batch, id)
-		if err != nil {
-			atomic.AddInt64(failCounter, int64(len(batch)))
+		if len(batch.Entries) == 0 {
+			// Safety check: skip empty batches
+			results <- BatchResult{SeqNum: batch.SeqNum, Success: true, Count: 0}
 			continue
 		}
 
-		// Track progress (last entry in batch)
-		last := batch[len(batch)-1]
-		mu.Lock()
-		if last.Dirhash > lastEntry.Dirhash ||
-			(last.Dirhash == lastEntry.Dirhash && last.Name > lastEntry.Name) {
-			*lastEntry = last
+		err := commitBatch(ctx, tikvClient, prefix, enable1PC, batch.Entries, id, maxRetryCount, retryBaseDelayMs)
+		if err != nil {
+			results <- BatchResult{
+				SeqNum:    batch.SeqNum,
+				LastEntry: batch.Entries[len(batch.Entries)-1],
+				Success:   false,
+				Count:     len(batch.Entries),
+			}
+			continue
 		}
-		mu.Unlock()
 
-		atomic.AddInt64(successCounter, int64(len(batch)))
+		results <- BatchResult{
+			SeqNum:    batch.SeqNum,
+			LastEntry: batch.Entries[len(batch.Entries)-1],
+			Success:   true,
+			Count:     len(batch.Entries),
+		}
 	}
+}
+
+// ========== Progress Tracker ==========
+// Tracks batch completion to safely determine resume point.
+// Only advances progress when contiguous batches have succeeded.
+
+type ProgressTracker struct {
+	mu              sync.Mutex
+	completedSeqs   map[int64]Entry // seqNum -> lastEntry for completed batches
+	highestContig   int64           // highest contiguous completed sequence
+	successCount    int64
+	failCount       int64
+	hasFailure      bool // set to true if any batch fails
+	failedSeqs      map[int64]bool
+}
+
+func NewProgressTracker() *ProgressTracker {
+	return &ProgressTracker{
+		completedSeqs: make(map[int64]Entry),
+		failedSeqs:    make(map[int64]bool),
+		highestContig: -1,
+	}
+}
+
+func (pt *ProgressTracker) RecordResult(result BatchResult) {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+
+	if result.Success {
+		pt.completedSeqs[result.SeqNum] = result.LastEntry
+		pt.successCount += int64(result.Count)
+
+		// Update highest contiguous sequence
+		for {
+			nextSeq := pt.highestContig + 1
+			if _, ok := pt.completedSeqs[nextSeq]; ok {
+				pt.highestContig = nextSeq
+			} else if pt.failedSeqs[nextSeq] {
+				// Stop at failures - don't advance past them
+				break
+			} else {
+				break
+			}
+		}
+	} else {
+		pt.failCount += int64(result.Count)
+		pt.hasFailure = true
+		pt.failedSeqs[result.SeqNum] = true
+	}
+}
+
+func (pt *ProgressTracker) GetSafeResumePoint() (Entry, bool) {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+
+	if pt.highestContig < 0 {
+		return Entry{}, false
+	}
+	entry, ok := pt.completedSeqs[pt.highestContig]
+	return entry, ok
+}
+
+func (pt *ProgressTracker) GetCounts() (success, fail int64, hasFailure bool) {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+	return pt.successCount, pt.failCount, pt.hasFailure
 }
 
 // ========== Main ==========
@@ -270,6 +389,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Validate table name to prevent SQL injection
+	if !validTableName.MatchString(*table) {
+		log.Fatalf("Invalid table name %q: must start with letter/underscore and contain only alphanumeric, underscore, or hyphen", *table)
+	}
+
+	// Validate partition parameters
+	if *partitionMod <= 0 {
+		log.Fatalf("Invalid partition-mod %d: must be > 0", *partitionMod)
+	}
+	if *partitionID < 0 || *partitionID >= *partitionMod {
+		log.Fatalf("Invalid partition-id %d: must be >= 0 and < partition-mod (%d)", *partitionID, *partitionMod)
+	}
+
 	// Parse Postgres config
 	var pgConfig FilerConfig
 	if _, err := toml.DecodeFile(*pgConfigFile, &pgConfig); err != nil {
@@ -288,6 +420,23 @@ func main() {
 		log.Fatalf("No [tikv] section found in %s", *tikvConfigFile)
 	}
 
+	// Validate TLS paths if specified
+	if tikvConfig.TiKV.CAPath != "" {
+		if _, err := os.Stat(tikvConfig.TiKV.CAPath); err != nil {
+			log.Fatalf("TLS CA path not accessible: %v", err)
+		}
+	}
+	if tikvConfig.TiKV.CertPath != "" {
+		if _, err := os.Stat(tikvConfig.TiKV.CertPath); err != nil {
+			log.Fatalf("TLS cert path not accessible: %v", err)
+		}
+	}
+	if tikvConfig.TiKV.KeyPath != "" {
+		if _, err := os.Stat(tikvConfig.TiKV.KeyPath); err != nil {
+			log.Fatalf("TLS key path not accessible: %v", err)
+		}
+	}
+
 	// Print config summary
 	log.Printf("seaweed-pg2tikv version %s", Version)
 	log.Println("=== Configuration ===")
@@ -303,6 +452,7 @@ func main() {
 		tikvConfig.TiKV.Enable1PC)
 	log.Printf("Workers:  %d, Batch: %d, Partition: %d/%d",
 		*workers, *batchSize, *partitionID, *partitionMod)
+	log.Printf("Retries:  max=%d, base_delay=%dms", *maxRetries, *retryBaseMs)
 
 	if *dryRun {
 		log.Println("Dry run - config parsed successfully, exiting without migration")
@@ -324,10 +474,13 @@ func main() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	// Load resume state
-	state := loadState(actualStateFile)
+	state, err := loadState(actualStateFile)
+	if err != nil {
+		log.Fatalf("Failed to load state: %v", err)
+	}
 	if state.Table != "" && state.Table != *table {
 		log.Printf("Warning: state file is for table %q, resetting for %q", state.Table, *table)
-		state = &State{StartedAt: time.Now().UTC().Format(time.RFC3339)}
+		state = &State{StartedAt: time.Now().UTC().Format(time.RFC3339), LastDirhash: MinInt64}
 	}
 	state.Table = *table
 
@@ -367,21 +520,29 @@ func main() {
 
 	prefix := []byte(tikvConfig.TiKV.KeyPrefix)
 	enable1PC := tikvConfig.TiKV.Enable1PC
-	var successCounter int64 = state.TotalMigrated
-	var failCounter int64 = 0
-	var lastEntry Entry
-	lastEntry.Dirhash = state.LastDirhash
-	lastEntry.Name = state.LastName
-	var mu sync.Mutex
 
-	entryChan := make(chan []Entry, *workers*2)
+	// Initialize progress tracker
+	tracker := NewProgressTracker()
+
+	batchChan := make(chan Batch, *workers*2)
+	resultChan := make(chan BatchResult, *workers*2)
 
 	// Start workers
 	var wg sync.WaitGroup
 	for i := 0; i < *workers; i++ {
 		wg.Add(1)
-		go worker(ctx, i, tikvClient, prefix, enable1PC, entryChan, &successCounter, &failCounter, &lastEntry, &mu, &wg)
+		go worker(ctx, i, tikvClient, prefix, enable1PC, batchChan, resultChan, *maxRetries, *retryBaseMs, &wg)
 	}
+
+	// Result collector goroutine
+	var collectorWg sync.WaitGroup
+	collectorWg.Add(1)
+	go func() {
+		defer collectorWg.Done()
+		for result := range resultChan {
+			tracker.RecordResult(result)
+		}
+	}()
 
 	// Progress reporter
 	startTime := time.Now()
@@ -394,29 +555,35 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				success := atomic.LoadInt64(&successCounter)
-				failed := atomic.LoadInt64(&failCounter)
+				success, failed, _ := tracker.GetCounts()
 				rate := float64(success-lastCount) / 10.0
 				lastCount = success
 				elapsed := time.Since(startTime)
 
-				mu.Lock()
-				le := lastEntry
-				mu.Unlock()
+				safeEntry, hasSafe := tracker.GetSafeResumePoint()
+				dirhash := state.LastDirhash
+				if hasSafe {
+					dirhash = safeEntry.Dirhash
+				}
 
 				log.Printf("Progress: %d OK, %d FAILED (%.0f/sec) | elapsed: %v | dirhash: %d",
-					success, failed, rate, elapsed.Round(time.Second), le.Dirhash)
+					success, failed, rate, elapsed.Round(time.Second), dirhash)
 
-				// Save state
-				state.TotalMigrated = success
-				state.LastDirhash = le.Dirhash
-				state.LastName = le.Name
-				saveState(actualStateFile, state)
+				// Save state only from safe resume point
+				if hasSafe {
+					state.TotalMigrated = success
+					state.LastDirhash = safeEntry.Dirhash
+					state.LastName = safeEntry.Name
+					if err := saveState(actualStateFile, state); err != nil {
+						log.Printf("Warning: failed to save state: %v", err)
+					}
+				}
 			}
 		}
 	}()
 
 	// Query with resume and partitioning
+	// Table name has been validated against SQL injection
 	query := fmt.Sprintf(`
 		SELECT dirhash, directory, name, meta
 		FROM %q
@@ -435,8 +602,9 @@ func main() {
 	}
 	defer rows.Close()
 
-	batch := make([]Entry, 0, *batchSize)
-	rowCount := int64(0)
+	entries := make([]Entry, 0, *batchSize)
+	var rowCount int64
+	var batchSeqNum int64
 	done := make(chan struct{})
 
 	go func() {
@@ -449,18 +617,19 @@ func main() {
 			}
 
 			rowCount++
-			batch = append(batch, e)
-			if len(batch) >= *batchSize {
+			entries = append(entries, e)
+			if len(entries) >= *batchSize {
 				select {
-				case entryChan <- batch:
-					batch = make([]Entry, 0, *batchSize)
+				case batchChan <- Batch{SeqNum: batchSeqNum, Entries: entries}:
+					batchSeqNum++
+					entries = make([]Entry, 0, *batchSize)
 				case <-ctx.Done():
 					return
 				}
 			}
 		}
-		if len(batch) > 0 {
-			entryChan <- batch
+		if len(entries) > 0 {
+			batchChan <- Batch{SeqNum: batchSeqNum, Entries: entries}
 		}
 	}()
 
@@ -473,23 +642,29 @@ func main() {
 		log.Printf("All %d rows read from Postgres, waiting for workers...", rowCount)
 	}
 
-	close(entryChan)
+	close(batchChan)
 	wg.Wait()
+	close(resultChan)
+	collectorWg.Wait()
 
-	// Final state save
-	finalSuccess := atomic.LoadInt64(&successCounter)
-	finalFailed := atomic.LoadInt64(&failCounter)
-	mu.Lock()
-	state.TotalMigrated = finalSuccess
-	state.LastDirhash = lastEntry.Dirhash
-	state.LastName = lastEntry.Name
-	mu.Unlock()
-	saveState(actualStateFile, state)
+	// Final state save - only from safe resume point
+	finalSuccess, finalFailed, hadFailure := tracker.GetCounts()
+	if safeEntry, hasSafe := tracker.GetSafeResumePoint(); hasSafe {
+		state.TotalMigrated = finalSuccess
+		state.LastDirhash = safeEntry.Dirhash
+		state.LastName = safeEntry.Name
+		if err := saveState(actualStateFile, state); err != nil {
+			log.Printf("Error: failed to save final state: %v", err)
+		}
+	}
 
 	log.Println("=== Migration Complete ===")
 	log.Printf("Rows read from Postgres: %d", rowCount)
 	log.Printf("Successfully written to TiKV: %d", finalSuccess)
 	log.Printf("Failed to write: %d", finalFailed)
+	if hadFailure {
+		log.Printf("WARNING: Some batches failed. Re-run to retry from saved checkpoint.")
+	}
 	log.Printf("State saved to: %s", actualStateFile)
 	log.Printf("seaweed-pg2tikv version %s", Version)
 }

@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.4] - 2026-01-28
+
+### Security
+- Added SQL injection prevention: table names now validated against safe pattern
+- Added TLS certificate path validation before use
+
+### Bug Fixes
+- Fixed race condition in progress tracking: now uses contiguous batch completion
+- Fixed ignored errors in state file read/write operations (now fail loudly)
+- Fixed Set errors being ignored in batch commits (now fail batch properly)
+- Fixed commit using background context (now respects cancellation)
+- Fixed version inconsistency between main.go and audit.go (unified at 1.0.4)
+- Added empty batch safety check to prevent potential panic
+
+### Improvements
+- Added input validation for partition-mod and partition-id flags
+- Made retry parameters configurable (--max-retries, --retry-base-ms)
+- Improved key prefix checking in count_keys.go using bytes.HasPrefix
+- Added version flag and output to count_keys.go
+- Added SHA1 usage documentation (required for SeaweedFS compatibility)
+- Progress tracking now only advances on contiguous successful batches
+
 ## [1.0.3] - 2026-01-28
 
 - Initial changelog created

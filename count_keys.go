@@ -1,10 +1,13 @@
 // seaweed-count-keys - Count TiKV keys with a given prefix
+// Version 1.0.4
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"time"
 
@@ -12,24 +15,49 @@ import (
 	"github.com/tikv/client-go/v2/txnkv"
 )
 
+const Version = "1.0.4"
+
 var (
-	pdAddrs   = flag.String("pd", "localhost:2379", "PD addresses (comma-separated)")
-	prefix    = flag.String("prefix", "", "Key prefix to count")
-	caPath    = flag.String("ca", "", "CA certificate path")
-	certPath  = flag.String("cert", "", "Client certificate path")
-	keyPath   = flag.String("key", "", "Client key path")
+	pdAddrs     = flag.String("pd", "localhost:2379", "PD addresses (comma-separated)")
+	prefix      = flag.String("prefix", "", "Key prefix to count")
+	caPath      = flag.String("ca", "", "CA certificate path")
+	certPath    = flag.String("cert", "", "Client certificate path")
+	keyPath     = flag.String("key", "", "Client key path")
+	showVersion = flag.Bool("version", false, "Show version and exit")
 )
 
 func main() {
 	flag.Parse()
 
+	if *showVersion {
+		fmt.Printf("seaweed-count-keys version %s\n", Version)
+		return
+	}
+
 	if *prefix == "" {
-		fmt.Println("seaweed-count-keys - Count TiKV keys with a given prefix")
+		fmt.Printf("seaweed-count-keys version %s - Count TiKV keys with a given prefix\n", Version)
 		fmt.Println()
 		fmt.Println("Usage: seaweed-count-keys --pd=<pd-addrs> --prefix=<key-prefix>")
 		fmt.Println()
 		flag.PrintDefaults()
 		return
+	}
+
+	// Validate TLS paths if specified
+	if *caPath != "" {
+		if _, err := os.Stat(*caPath); err != nil {
+			log.Fatalf("TLS CA path not accessible: %v", err)
+		}
+	}
+	if *certPath != "" {
+		if _, err := os.Stat(*certPath); err != nil {
+			log.Fatalf("TLS cert path not accessible: %v", err)
+		}
+	}
+	if *keyPath != "" {
+		if _, err := os.Stat(*keyPath); err != nil {
+			log.Fatalf("TLS key path not accessible: %v", err)
+		}
 	}
 
 	// Configure TLS if provided
@@ -71,10 +99,8 @@ func main() {
 
 	for iter.Valid() {
 		key := iter.Key()
-		if len(key) < len(prefixBytes) {
-			break
-		}
-		if string(key[:len(prefixBytes)]) != *prefix {
+		// Use bytes.HasPrefix for efficient comparison (no string allocation)
+		if !bytes.HasPrefix(key, prefixBytes) {
 			break
 		}
 
@@ -100,4 +126,5 @@ func main() {
 	log.Printf("Prefix: %q", *prefix)
 	log.Printf("Total keys: %d", count)
 	log.Printf("Time: %v", elapsed.Round(time.Second))
+	log.Printf("seaweed-count-keys version %s", Version)
 }

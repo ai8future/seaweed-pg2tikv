@@ -1,5 +1,5 @@
 // seaweed-pg2tikv-audit - Verify migration by comparing Postgres to TiKV
-// Version 1.0.0
+// Version 1.0.4
 package main
 
 import (
@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,8 +24,11 @@ import (
 	"github.com/tikv/client-go/v2/txnkv"
 )
 
-const Version = "1.0.1"
+const Version = "1.0.4"
 const MinInt64 = -9223372036854775808
+
+// validTableName validates that a table name contains only safe characters
+var validTableName = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_\-]*$`)
 
 // ========== Config Structures ==========
 
@@ -102,6 +106,8 @@ var (
 )
 
 // ========== TiKV Key Generation ==========
+// Note: SHA1 is required here to match SeaweedFS filer's key generation.
+// This is not for cryptographic security, just consistent key derivation.
 
 func hashToBytes(dir string) []byte {
 	h := sha1.New()
@@ -232,6 +238,11 @@ func main() {
 		log.Fatalf("Invalid mode %q. Use 'sample' or 'complete'", *mode)
 	}
 
+	// Validate table name to prevent SQL injection
+	if !validTableName.MatchString(*table) {
+		log.Fatalf("Invalid table name %q: must start with letter/underscore and contain only alphanumeric, underscore, or hyphen", *table)
+	}
+
 	// Parse Postgres config
 	var pgConfig FilerConfig
 	if _, err := toml.DecodeFile(*pgConfigFile, &pgConfig); err != nil {
@@ -242,6 +253,23 @@ func main() {
 	var tikvConfig FilerConfig
 	if _, err := toml.DecodeFile(*tikvConfigFile, &tikvConfig); err != nil {
 		log.Fatalf("Failed to parse tikv config: %v", err)
+	}
+
+	// Validate TLS paths if specified
+	if tikvConfig.TiKV.CAPath != "" {
+		if _, err := os.Stat(tikvConfig.TiKV.CAPath); err != nil {
+			log.Fatalf("TLS CA path not accessible: %v", err)
+		}
+	}
+	if tikvConfig.TiKV.CertPath != "" {
+		if _, err := os.Stat(tikvConfig.TiKV.CertPath); err != nil {
+			log.Fatalf("TLS cert path not accessible: %v", err)
+		}
+	}
+	if tikvConfig.TiKV.KeyPath != "" {
+		if _, err := os.Stat(tikvConfig.TiKV.KeyPath); err != nil {
+			log.Fatalf("TLS key path not accessible: %v", err)
+		}
 	}
 
 	log.Printf("seaweed-pg2tikv-audit version %s", Version)
@@ -274,7 +302,7 @@ func main() {
 	}
 	log.Println("Connected to Postgres")
 
-	// Get row count
+	// Get row count (table name validated above)
 	var totalRows int64
 	err = db.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %q", *table)).Scan(&totalRows)
 	if err != nil {
@@ -365,9 +393,10 @@ func main() {
 	}()
 
 	// Build query based on mode
+	// Table name has been validated against SQL injection
 	var query string
 	if *mode == "sample" {
-		// Random sample using TABLESAMPLE or ORDER BY RANDOM()
+		// Random sample using ORDER BY RANDOM()
 		query = fmt.Sprintf(`
 			SELECT dirhash, directory, name, meta
 			FROM %q
