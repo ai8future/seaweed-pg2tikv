@@ -1,5 +1,5 @@
 // seaweed-pg2tikv - Migrate SeaweedFS filer metadata from Postgres to TiKV
-// Version 1.0.4
+// Version 1.1.0
 package main
 
 import (
@@ -25,7 +25,7 @@ import (
 	"github.com/tikv/client-go/v2/txnkv"
 )
 
-const Version = "1.0.4"
+const Version = "1.1.5"
 
 const MinInt64 = -9223372036854775808
 
@@ -199,6 +199,18 @@ type BatchResult struct {
 	Count     int
 }
 
+// sleepCtx sleeps for the given duration but returns early if the context is cancelled.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
 func commitBatch(ctx context.Context, tikvClient *txnkv.Client, prefix []byte, enable1PC bool, batch []Entry, workerID int, maxRetryCount int, retryBaseDelayMs int) error {
 	for retry := 0; retry < maxRetryCount; retry++ {
 		if ctx.Err() != nil {
@@ -208,7 +220,9 @@ func commitBatch(ctx context.Context, tikvClient *txnkv.Client, prefix []byte, e
 		txn, err := tikvClient.Begin()
 		if err != nil {
 			log.Printf("[worker-%02d] begin txn error (attempt %d/%d): %v", workerID, retry+1, maxRetryCount, err)
-			time.Sleep(time.Duration(retry+1) * 200 * time.Millisecond)
+			if !sleepCtx(ctx, time.Duration(retry+1)*time.Duration(retryBaseDelayMs)*time.Millisecond) {
+				return ctx.Err()
+			}
 			continue
 		}
 
@@ -232,7 +246,9 @@ func commitBatch(ctx context.Context, tikvClient *txnkv.Client, prefix []byte, e
 			backoff := time.Duration(retry+1) * time.Duration(retryBaseDelayMs) * time.Millisecond
 			if retry < maxRetryCount-1 {
 				log.Printf("[worker-%02d] RETRY %d/%d after set error (backoff %v): %v", workerID, retry+1, maxRetryCount, backoff, setErr)
-				time.Sleep(backoff)
+				if !sleepCtx(ctx, backoff) {
+					return ctx.Err()
+				}
 				continue
 			}
 			return setErr
@@ -250,7 +266,9 @@ func commitBatch(ctx context.Context, tikvClient *txnkv.Client, prefix []byte, e
 		backoff := time.Duration(retry+1) * time.Duration(retryBaseDelayMs) * time.Millisecond
 		if retry < maxRetryCount-1 {
 			log.Printf("[worker-%02d] RETRY %d/%d (backoff %v): %v", workerID, retry+1, maxRetryCount, backoff, err)
-			time.Sleep(backoff)
+			if !sleepCtx(ctx, backoff) {
+				return ctx.Err()
+			}
 		} else {
 			log.Printf("[worker-%02d] FAILED after %d attempts: %v", workerID, maxRetryCount, err)
 			return err
@@ -582,25 +600,36 @@ func main() {
 		}
 	}()
 
-	// Query with resume and partitioning
+	// Paginated query with resume and partitioning
 	// Table name has been validated against SQL injection
-	query := fmt.Sprintf(`
-		SELECT dirhash, directory, name, meta
-		FROM %q
-		WHERE (dirhash, name) > ($1, $2)
-		  AND mod(abs(dirhash), $3) = $4
-		ORDER BY dirhash, name`,
-		*table)
+	queryLimit := *batchSize * *workers * 2
 
-	log.Printf("Starting from dirhash=%d name=%q", state.LastDirhash, state.LastName)
-
-	rows, err := db.QueryContext(ctx, query,
-		state.LastDirhash, state.LastName,
-		*partitionMod, *partitionID)
-	if err != nil {
-		log.Fatalf("Query failed: %v", err)
+	// When partition-mod=1 (single instance), skip the mod() clause
+	// so Postgres can use an index on (dirhash, name)
+	var query string
+	usePartitioning := *partitionMod > 1
+	if usePartitioning {
+		query = fmt.Sprintf(`
+			SELECT dirhash, directory, name, meta
+			FROM %q
+			WHERE (dirhash, name) > ($1, $2)
+			  AND mod(abs(dirhash), $3) = $4
+			ORDER BY dirhash, name
+			LIMIT $5`,
+			*table)
+	} else {
+		query = fmt.Sprintf(`
+			SELECT dirhash, directory, name, meta
+			FROM %q
+			WHERE (dirhash, name) > ($1, $2)
+			ORDER BY dirhash, name
+			LIMIT $3`,
+			*table)
 	}
-	defer rows.Close()
+
+	curDirhash := state.LastDirhash
+	curName := state.LastName
+	log.Printf("Starting from dirhash=%d name=%q (page size: %d)", curDirhash, curName, queryLimit)
 
 	entries := make([]Entry, 0, *batchSize)
 	var rowCount int64
@@ -609,35 +638,114 @@ func main() {
 
 	go func() {
 		defer close(done)
-		for rows.Next() {
-			var e Entry
-			if err := rows.Scan(&e.Dirhash, &e.Directory, &e.Name, &e.Meta); err != nil {
-				log.Printf("Scan error: %v", err)
+		queryRetries := 0
+		const maxQueryRetries = 10
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+
+			var rows *sql.Rows
+			var err error
+			if usePartitioning {
+				rows, err = db.QueryContext(ctx, query,
+					curDirhash, curName,
+					*partitionMod, *partitionID,
+					queryLimit)
+			} else {
+				rows, err = db.QueryContext(ctx, query,
+					curDirhash, curName,
+					queryLimit)
+			}
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				queryRetries++
+				if queryRetries > maxQueryRetries {
+					log.Printf("Query failed after %d retries, giving up: %v", maxQueryRetries, err)
+					return
+				}
+				backoff := time.Duration(queryRetries) * 5 * time.Second
+				log.Printf("Query error (retry %d/%d, backoff %v): %v", queryRetries, maxQueryRetries, backoff, err)
+				if !sleepCtx(ctx, backoff) {
+					return
+				}
+				continue
+			}
+			queryRetries = 0 // reset on success
+
+			pageCount := 0
+			for rows.Next() {
+				var e Entry
+				if err := rows.Scan(&e.Dirhash, &e.Directory, &e.Name, &e.Meta); err != nil {
+					log.Printf("Scan error: %v", err)
+					continue
+				}
+
+				rowCount++
+				pageCount++
+				curDirhash = e.Dirhash
+				curName = e.Name
+				entries = append(entries, e)
+				if len(entries) >= *batchSize {
+					select {
+					case batchChan <- Batch{SeqNum: batchSeqNum, Entries: entries}:
+						batchSeqNum++
+						entries = make([]Entry, 0, *batchSize)
+					case <-ctx.Done():
+						rows.Close()
+						return
+					}
+				}
+			}
+			rows.Close()
+
+			if err := rows.Err(); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				queryRetries++
+				if queryRetries > maxQueryRetries {
+					log.Printf("Query iteration failed after %d retries, giving up: %v", maxQueryRetries, err)
+					return
+				}
+				backoff := time.Duration(queryRetries) * 5 * time.Second
+				log.Printf("Query iteration error (retry %d/%d from last position, backoff %v): %v",
+					queryRetries, maxQueryRetries, backoff, err)
+				if !sleepCtx(ctx, backoff) {
+					return
+				}
 				continue
 			}
 
-			rowCount++
-			entries = append(entries, e)
-			if len(entries) >= *batchSize {
-				select {
-				case batchChan <- Batch{SeqNum: batchSeqNum, Entries: entries}:
-					batchSeqNum++
-					entries = make([]Entry, 0, *batchSize)
-				case <-ctx.Done():
-					return
-				}
+			// If we got fewer rows than the limit, we've read everything
+			if pageCount < queryLimit {
+				break
 			}
+			log.Printf("Page complete: %d rows fetched this page, continuing from dirhash=%d", pageCount, curDirhash)
 		}
+
+		// Flush remaining entries
 		if len(entries) > 0 {
-			batchChan <- Batch{SeqNum: batchSeqNum, Entries: entries}
+			select {
+			case batchChan <- Batch{SeqNum: batchSeqNum, Entries: entries}:
+			case <-ctx.Done():
+			}
 		}
 	}()
 
 	// Wait for completion or interrupt
 	select {
 	case <-sigChan:
-		log.Println("Interrupt received, saving state...")
+		log.Println("Interrupt received, saving state and draining workers...")
 		cancel()
+		// Second Ctrl-C force-exits
+		go func() {
+			<-sigChan
+			log.Println("Second interrupt received, force exiting")
+			os.Exit(1)
+		}()
 	case <-done:
 		log.Printf("All %d rows read from Postgres, waiting for workers...", rowCount)
 	}

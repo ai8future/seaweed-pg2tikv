@@ -15,7 +15,7 @@ import (
 	"github.com/tikv/client-go/v2/txnkv"
 )
 
-const Version = "1.0.4"
+const Version = "1.1.5"
 
 var (
 	pdAddrs     = flag.String("pd", "localhost:2379", "PD addresses (comma-separated)")

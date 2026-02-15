@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.5] - 2026-02-15
+
+### Performance
+- Skip mod(abs(dirhash), N) clause in Postgres query when partition-mod=1 (single instance), allowing Postgres to use index on (dirhash, name) instead of full table scan + sort per page
+
+Agent: Claude Code (Claude:Opus 4.6)
+
 ## [1.0.5] - 2026-01-28
 
 ### Bug Fixes

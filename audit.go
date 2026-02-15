@@ -24,7 +24,7 @@ import (
 	"github.com/tikv/client-go/v2/txnkv"
 )
 
-const Version = "1.0.4"
+const Version = "1.1.5"
 const MinInt64 = -9223372036854775808
 
 // validTableName validates that a table name contains only safe characters
