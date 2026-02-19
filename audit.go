@@ -24,7 +24,7 @@ import (
 	"github.com/tikv/client-go/v2/txnkv"
 )
 
-const Version = "1.1.5"
+const Version = "1.2.0"
 const MinInt64 = -9223372036854775808
 
 // validTableName validates that a table name contains only safe characters
@@ -103,6 +103,7 @@ var (
 	showVersion    = flag.Bool("version", false, "Show version and exit")
 	maxMismatches  = flag.Int("max-mismatches", 100, "Stop after this many mismatches (0=unlimited)")
 	verbose        = flag.Bool("verbose", false, "Show detailed byte comparison for mismatches")
+	pathPrefix     = flag.String("path-prefix", "", "Path prefix for per-bucket tables (e.g., /buckets/my-bucket)")
 )
 
 // ========== TiKV Key Generation ==========
@@ -125,6 +126,17 @@ func generateTiKVKey(prefix []byte, directory, filename string) []byte {
 		return result
 	}
 	return key
+}
+
+// applyPathPrefix prepends the bucket path to the directory for per-bucket tables.
+func applyPathPrefix(prefix, directory string) string {
+	if prefix == "" {
+		return directory
+	}
+	if directory == "/" {
+		return prefix
+	}
+	return prefix + directory
 }
 
 // ========== Entry ==========
@@ -189,7 +201,8 @@ func auditWorker(ctx context.Context, id int, tikvClient *txnkv.Client, prefix [
 			return
 		}
 
-		key := generateTiKVKey(prefix, entry.Directory, entry.Name)
+		effectiveDir := applyPathPrefix(*pathPrefix, entry.Directory)
+		key := generateTiKVKey(prefix, effectiveDir, entry.Name)
 
 		txn, err := tikvClient.Begin()
 		if err != nil {
@@ -238,6 +251,14 @@ func main() {
 		log.Fatalf("Invalid mode %q. Use 'sample' or 'complete'", *mode)
 	}
 
+	// Validate path prefix
+	if *pathPrefix != "" {
+		if !strings.HasPrefix(*pathPrefix, "/") {
+			log.Fatalf("Invalid path-prefix %q: must start with /", *pathPrefix)
+		}
+		*pathPrefix = strings.TrimRight(*pathPrefix, "/")
+	}
+
 	// Validate table name to prevent SQL injection
 	if !validTableName.MatchString(*table) {
 		log.Fatalf("Invalid table name %q: must start with letter/underscore and contain only alphanumeric, underscore, or hyphen", *table)
@@ -281,6 +302,9 @@ func main() {
 		pgConfig.Postgres2.Database,
 		*table)
 	log.Printf("TiKV PD:  %s (prefix: %q)", tikvConfig.TiKV.PDAddrs, tikvConfig.TiKV.KeyPrefix)
+	if *pathPrefix != "" {
+		log.Printf("Path prefix: %s (per-bucket table mode)", *pathPrefix)
+	}
 	log.Printf("Mode: %s, Workers: %d", *mode, *workers)
 	if *mode == "sample" {
 		log.Printf("Sample size: %d", *sampleSize)

@@ -122,6 +122,7 @@ You can use a single file with both sections or separate files.
 | `--state` | `migrate_state_{table}.json` | Progress state file |
 | `--partition-mod` | `1` | Total partitions for parallel instances |
 | `--partition-id` | `0` | This instance's partition (0 to mod-1) |
+| `--path-prefix` | (empty) | Path prefix for per-bucket tables (e.g., `/buckets/my-bucket`) |
 | `--dry-run` | `false` | Parse configs and exit without migrating |
 | `--version` | | Show version and exit |
 
@@ -138,11 +139,17 @@ You can use a single file with both sections or separate files.
 ```
 
 **Bucket-specific table (postgres2 with SupportBucketTable=true):**
+
+> **IMPORTANT:** Per-bucket tables in PostgreSQL store paths relative to the bucket root.
+> You MUST use `--path-prefix` to reconstruct the full path for TiKV, otherwise entries
+> will be written to the wrong location and your filer data will appear corrupted.
+
 ```bash
 ./seaweed-pg2tikv-linux-amd64 \
   --pg-config=/etc/seaweedfs/filer.toml \
   --tikv-config=./backup_filer.toml \
-  --table="my-bucket-name"
+  --table="my-bucket-name" \
+  --path-prefix="/buckets/my-bucket-name"
 ```
 
 **Parallel migration with 5 instances:**
@@ -255,6 +262,7 @@ Verify that migration completed successfully by comparing Postgres data to TiKV.
 | `--sample-size` | `10000` | Rows to check in sample mode |
 | `--workers` | `10` | Parallel verification workers |
 | `--show-missing` | `false` | Print details of missing/mismatched entries |
+| `--path-prefix` | (empty) | Path prefix for per-bucket tables (e.g., `/buckets/my-bucket`) |
 | `--version` | | Show version and exit |
 
 ### Examples
@@ -383,12 +391,12 @@ SELECT 'my-bucket', COUNT(*) FROM "my-bucket";
 ### Step 2: Migrate Each Table
 
 ```bash
-# Main filemeta table
+# Main filemeta table (no --path-prefix needed)
 ./seaweed-pg2tikv-linux-amd64 --table="filemeta" ...
 
-# Each bucket table
-./seaweed-pg2tikv-linux-amd64 --table="bucket-a" ...
-./seaweed-pg2tikv-linux-amd64 --table="bucket-b" ...
+# Each bucket table (MUST use --path-prefix)
+./seaweed-pg2tikv-linux-amd64 --table="bucket-a" --path-prefix="/buckets/bucket-a" ...
+./seaweed-pg2tikv-linux-amd64 --table="bucket-b" --path-prefix="/buckets/bucket-b" ...
 ```
 
 ### Step 3: Verify Migration
@@ -415,6 +423,18 @@ psql -c "SELECT SUM(c) FROM (SELECT COUNT(*) c FROM filemeta UNION ALL SELECT CO
 ---
 
 ## Troubleshooting
+
+### Corrupted Data / Missing Root Directories After Migration
+
+If root directories disappeared and subdirectories appear at the wrong level, you likely migrated per-bucket PostgreSQL tables without `--path-prefix`. SeaweedFS's postgres2 store strips the bucket path before storing to per-bucket tables, so entries have paths relative to the bucket root. Without `--path-prefix`, these relative paths get written directly to TiKV, placing entries under `/` instead of `/buckets/<name>/`.
+
+**Fix:**
+1. Wipe the corrupted TiKV data (or delete keys with the seaweedfs prefix)
+2. Re-run migration with `--path-prefix` for each bucket table:
+```bash
+./seaweed-pg2tikv-linux-amd64 --table="filemeta" ...
+./seaweed-pg2tikv-linux-amd64 --table="my-bucket" --path-prefix="/buckets/my-bucket" ...
+```
 
 ### "prewrite encounters lock" Errors
 

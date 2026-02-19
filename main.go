@@ -25,7 +25,7 @@ import (
 	"github.com/tikv/client-go/v2/txnkv"
 )
 
-const Version = "1.1.5"
+const Version = "1.2.0"
 
 const MinInt64 = -9223372036854775808
 
@@ -107,6 +107,7 @@ var (
 	showVersion    = flag.Bool("version", false, "Show version and exit")
 	maxRetries     = flag.Int("max-retries", 15, "Maximum retries per batch")
 	retryBaseMs    = flag.Int("retry-base-ms", 500, "Base retry delay in milliseconds")
+	pathPrefix     = flag.String("path-prefix", "", "Path prefix for per-bucket tables (e.g., /buckets/my-bucket)")
 )
 
 // ========== State Management ==========
@@ -174,6 +175,20 @@ func generateTiKVKey(prefix []byte, directory, filename string) []byte {
 		return result
 	}
 	return key
+}
+
+// applyPathPrefix prepends the bucket path to the directory for per-bucket tables.
+// SeaweedFS postgres2 stores paths relative to the bucket root, but TiKV needs
+// absolute paths. For the root filemeta table, pathPrefix is empty.
+// For bucket tables, pathPrefix is e.g. "/buckets/my-bucket".
+func applyPathPrefix(prefix, directory string) string {
+	if prefix == "" {
+		return directory
+	}
+	if directory == "/" {
+		return prefix
+	}
+	return prefix + directory
 }
 
 // ========== Entry & Worker ==========
@@ -401,6 +416,10 @@ func main() {
 		fmt.Println("  # Single instance migration")
 		fmt.Println("  seaweed-pg2tikv --pg-config=pg.toml --tikv-config=tikv.toml --table=rootseek-heic")
 		fmt.Println()
+		fmt.Println("  # Per-bucket table migration (REQUIRED for bucket tables)")
+		fmt.Println("  seaweed-pg2tikv --pg-config=pg.toml --tikv-config=tikv.toml --table=my-bucket \\")
+		fmt.Println("          --path-prefix=/buckets/my-bucket")
+		fmt.Println()
 		fmt.Println("  # Parallel migration with 5 instances")
 		fmt.Println("  seaweed-pg2tikv --pg-config=pg.toml --tikv-config=tikv.toml --table=rootseek-heic \\")
 		fmt.Println("          --partition-mod=5 --partition-id=0 --state=state_0.json")
@@ -410,6 +429,15 @@ func main() {
 	// Validate table name to prevent SQL injection
 	if !validTableName.MatchString(*table) {
 		log.Fatalf("Invalid table name %q: must start with letter/underscore and contain only alphanumeric, underscore, or hyphen", *table)
+	}
+
+	// Validate path prefix
+	if *pathPrefix != "" {
+		if !strings.HasPrefix(*pathPrefix, "/") {
+			log.Fatalf("Invalid path-prefix %q: must start with /", *pathPrefix)
+		}
+		// Remove trailing slash if present
+		*pathPrefix = strings.TrimRight(*pathPrefix, "/")
 	}
 
 	// Validate partition parameters
@@ -470,6 +498,9 @@ func main() {
 		tikvConfig.TiKV.Enable1PC)
 	log.Printf("Workers:  %d, Batch: %d, Partition: %d/%d",
 		*workers, *batchSize, *partitionID, *partitionMod)
+	if *pathPrefix != "" {
+		log.Printf("Path prefix: %s (per-bucket table mode)", *pathPrefix)
+	}
 	log.Printf("Retries:  max=%d, base_delay=%dms", *maxRetries, *retryBaseMs)
 
 	if *dryRun {
@@ -682,6 +713,9 @@ func main() {
 					log.Printf("Scan error: %v", err)
 					continue
 				}
+
+				// Apply path prefix for per-bucket tables
+				e.Directory = applyPathPrefix(*pathPrefix, e.Directory)
 
 				rowCount++
 				pageCount++

@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.0] - 2026-02-19
+
+### Bug Fixes
+- **CRITICAL:** Added --path-prefix flag for per-bucket table migration. SeaweedFS postgres2 stores paths relative to the bucket root in per-bucket tables, but TiKV needs absolute paths. Without --path-prefix, bucket table entries were written with wrong keys, causing corrupted directory listings (root directories disappear, subdirectories appear at wrong level).
+
+### Usage
+- For filemeta (root table): no --path-prefix needed
+- For bucket tables: use --path-prefix=/buckets/<bucket-name>
+- Flag added to both seaweed-pg2tikv and seaweed-pg2tikv-audit
+
+Agent: Claude Code (Claude:Opus 4.6)
+
 ## [1.1.5] - 2026-02-15
 
 ### Performance
