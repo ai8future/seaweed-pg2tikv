@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/tikv/client-go/v2/config"
+	"github.com/tikv/client-go/v2/rawkv"
 	"github.com/tikv/client-go/v2/txnkv"
 )
 
@@ -24,10 +25,24 @@ var (
 	caPath      = flag.String("ca", "", "CA certificate path")
 	certPath    = flag.String("cert", "", "Client certificate path")
 	keyPath     = flag.String("key", "", "Client key path")
-	deleteKeys  = flag.Bool("delete", false, "Delete all keys with the given prefix (use with caution!)")
-	batchSize   = flag.Int("batch", 5000, "Batch size for delete operations")
+	deleteKeys  = flag.Bool("delete", false, "Delete all keys with the given prefix (server-side DeleteRange)")
 	showVersion = flag.Bool("version", false, "Show version and exit")
 )
+
+// prefixEndKey returns the end key for a prefix scan/delete range.
+// It increments the last byte of the prefix to create an exclusive upper bound.
+func prefixEndKey(prefix []byte) []byte {
+	end := make([]byte, len(prefix))
+	copy(end, prefix)
+	for i := len(end) - 1; i >= 0; i-- {
+		if end[i] < 0xff {
+			end[i]++
+			return end[:i+1]
+		}
+	}
+	// All 0xff bytes — no upper bound possible (extremely unlikely for a text prefix)
+	return nil
+}
 
 func main() {
 	flag.Parse()
@@ -75,6 +90,14 @@ func main() {
 		addrs[i] = strings.TrimSpace(addrs[i])
 	}
 
+	if *deleteKeys {
+		deleteAllKeys(addrs)
+	} else {
+		countAllKeys(addrs)
+	}
+}
+
+func countAllKeys(addrs []string) {
 	client, err := txnkv.NewClient(addrs)
 	if err != nil {
 		log.Fatalf("Failed to connect to TiKV: %v", err)
@@ -82,15 +105,6 @@ func main() {
 	defer client.Close()
 
 	log.Printf("Connected to TiKV at %s", *pdAddrs)
-
-	if *deleteKeys {
-		deleteAllKeys(client)
-	} else {
-		countAllKeys(client)
-	}
-}
-
-func countAllKeys(client *txnkv.Client) {
 	log.Printf("Counting keys with prefix: %q", *prefix)
 
 	txn, err := client.Begin()
@@ -140,74 +154,36 @@ func countAllKeys(client *txnkv.Client) {
 	log.Printf("seaweed-count-keys version %s", Version)
 }
 
-func deleteAllKeys(client *txnkv.Client) {
-	log.Printf("DELETING all keys with prefix: %q (batch size: %d)", *prefix, *batchSize)
-
+func deleteAllKeys(addrs []string) {
 	ctx := context.Background()
 	prefixBytes := []byte(*prefix)
+	endKey := prefixEndKey(prefixBytes)
 
-	totalDeleted := int64(0)
+	log.Printf("Connecting to TiKV (raw client) at %s", *pdAddrs)
+
+	security := config.Security{
+		ClusterSSLCA:   *caPath,
+		ClusterSSLCert: *certPath,
+		ClusterSSLKey:  *keyPath,
+	}
+
+	client, err := rawkv.NewClient(ctx, addrs, security)
+	if err != nil {
+		log.Fatalf("Failed to connect raw client to TiKV: %v", err)
+	}
+	defer client.Close()
+
+	log.Printf("DELETING all keys in range [%q, %q) via server-side DeleteRange", *prefix, string(endKey))
+
 	startTime := time.Now()
-
-	for {
-		// Scan a batch of keys
-		scanTxn, err := client.Begin()
-		if err != nil {
-			log.Fatalf("Failed to begin scan transaction: %v", err)
-		}
-
-		iter, err := scanTxn.Iter(prefixBytes, nil)
-		if err != nil {
-			scanTxn.Rollback()
-			log.Fatalf("Failed to create iterator: %v", err)
-		}
-
-		keys := make([][]byte, 0, *batchSize)
-		for iter.Valid() && len(keys) < *batchSize {
-			key := iter.Key()
-			if !bytes.HasPrefix(key, prefixBytes) {
-				break
-			}
-			keys = append(keys, append([]byte(nil), key...))
-			if err := iter.Next(); err != nil {
-				break
-			}
-		}
-		iter.Close()
-		scanTxn.Rollback()
-
-		if len(keys) == 0 {
-			break
-		}
-
-		// Delete the batch
-		delTxn, err := client.Begin()
-		if err != nil {
-			log.Fatalf("Failed to begin delete transaction: %v", err)
-		}
-
-		for _, key := range keys {
-			if err := delTxn.Delete(key); err != nil {
-				delTxn.Rollback()
-				log.Fatalf("Failed to delete key: %v", err)
-			}
-		}
-
-		if err := delTxn.Commit(ctx); err != nil {
-			delTxn.Rollback()
-			log.Fatalf("Failed to commit delete batch: %v", err)
-		}
-
-		totalDeleted += int64(len(keys))
-		elapsed := time.Since(startTime)
-		rate := float64(totalDeleted) / elapsed.Seconds()
-		log.Printf("Deleted %d keys so far (%.0f/sec)...", totalDeleted, rate)
+	err = client.DeleteRange(ctx, prefixBytes, endKey)
+	if err != nil {
+		log.Fatalf("DeleteRange failed: %v", err)
 	}
 
 	elapsed := time.Since(startTime)
 	log.Printf("=== Delete Complete ===")
 	log.Printf("Prefix: %q", *prefix)
-	log.Printf("Total keys deleted: %d", totalDeleted)
-	log.Printf("Time: %v", elapsed.Round(time.Second))
+	log.Printf("DeleteRange completed in %v", elapsed.Round(time.Millisecond))
 	log.Printf("seaweed-count-keys version %s", Version)
 }
