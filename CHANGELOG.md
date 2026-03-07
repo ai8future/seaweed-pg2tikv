@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.6] - 2026-03-07
+
+### Features
+- Added `--shard N/M` flag to seaweed-cleanup: deterministically partitions directories by FNV hash so multiple instances process non-overlapping sets (e.g., `--shard 0/3`, `--shard 1/3`, `--shard 2/3`). Works with both sequential and `--random` modes.
+
+Agent: Claude Code (Claude:Opus 4.6)
+
+## [1.2.5] - 2026-03-07
+
+### Features
+- Added `--random` flag to seaweed-cleanup: shuffles directory processing order so multiple instances can run in parallel without duplicating work. Pre-collects all root directory names, shuffles them, then processes. Resume cursor is suppressed in random mode since it's not meaningful.
+
+Agent: Claude Code (Claude:Opus 4.6)
+
 ## [1.2.4] - 2026-03-07
 
 ### Features
