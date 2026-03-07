@@ -1,5 +1,5 @@
 // seaweed-pg2tikv-audit - Verify migration by comparing Postgres to TiKV
-// Version 1.0.4
+// Version 1.2.2
 package main
 
 import (
@@ -13,6 +13,7 @@ import (
 	"log"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,9 +23,10 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/tikv/client-go/v2/config"
 	"github.com/tikv/client-go/v2/txnkv"
+	"google.golang.org/protobuf/encoding/protowire"
 )
 
-const Version = "1.2.0"
+const Version = "1.2.2"
 const MinInt64 = -9223372036854775808
 
 // validTableName validates that a table name contains only safe characters
@@ -102,7 +104,7 @@ var (
 	showMissing    = flag.Bool("show-missing", false, "Print details of missing/mismatched entries")
 	showVersion    = flag.Bool("version", false, "Show version and exit")
 	maxMismatches  = flag.Int("max-mismatches", 100, "Stop after this many mismatches (0=unlimited)")
-	verbose        = flag.Bool("verbose", false, "Show detailed byte comparison for mismatches")
+	verbose        = flag.Bool("verbose", false, "Show detailed field-level comparison for mismatches")
 	pathPrefix     = flag.String("path-prefix", "", "Path prefix for per-bucket tables (e.g., /buckets/my-bucket)")
 )
 
@@ -155,12 +157,516 @@ type AuditResult struct {
 	TiKVMeta []byte
 }
 
+// ========== Protobuf Field Analysis ==========
+
+// SeaweedFS Entry protobuf field names
+var entryFieldNames = map[int]string{
+	1: "name", 2: "is_directory", 3: "attributes", 4: "chunks",
+	5: "extended", 7: "hard_link_id", 8: "hard_link_counter",
+	9: "content", 10: "remote_entry", 11: "quota",
+}
+
+// SeaweedFS FuseAttributes protobuf field names
+var attrFieldNames = map[int]string{
+	1: "file_size", 2: "mtime", 3: "file_mode", 4: "uid", 5: "gid",
+	6: "crtime", 7: "mime", 8: "replication", 9: "collection",
+	10: "ttl_sec", 11: "user_name", 12: "group_names",
+	13: "symlink_target", 14: "md5", 15: "disk_type",
+}
+
+// SeaweedFS FileChunk protobuf field names
+var chunkFieldNames = map[int]string{
+	1: "file_id", 2: "offset", 3: "size", 4: "modified_ts_ns",
+	5: "e_tag", 6: "source_file_id", 7: "fid", 8: "source_fid",
+	9: "cipher_key", 10: "is_compressed", 11: "is_chunk_manifest",
+}
+
+// SeaweedFS FileId protobuf field names
+var fileIdFieldNames = map[int]string{
+	1: "volume_id", 2: "file_key", 3: "cookie",
+}
+
+// Fields that contain unix timestamps in seconds
+var secondTimestampFields = map[string]bool{
+	"attributes.mtime": true, "attributes.crtime": true,
+}
+
+// Fields that contain unix timestamps in nanoseconds
+var nanoTimestampFields = map[string]bool{
+	"modified_ts_ns": true,
+}
+
+type fieldValue struct {
+	wireType protowire.Type
+	varint   uint64
+	fixed32  uint32
+	fixed64  uint64
+	bval     []byte
+}
+
+func parseProtoFields(data []byte) map[int][]fieldValue {
+	fields := make(map[int][]fieldValue)
+	for len(data) > 0 {
+		num, wtype, tagLen := protowire.ConsumeTag(data)
+		if tagLen < 0 {
+			break
+		}
+		data = data[tagLen:]
+
+		var fv fieldValue
+		fv.wireType = wtype
+
+		switch wtype {
+		case protowire.VarintType:
+			v, n := protowire.ConsumeVarint(data)
+			if n < 0 {
+				return fields
+			}
+			fv.varint = v
+			data = data[n:]
+		case protowire.Fixed32Type:
+			v, n := protowire.ConsumeFixed32(data)
+			if n < 0 {
+				return fields
+			}
+			fv.fixed32 = v
+			data = data[n:]
+		case protowire.Fixed64Type:
+			v, n := protowire.ConsumeFixed64(data)
+			if n < 0 {
+				return fields
+			}
+			fv.fixed64 = v
+			data = data[n:]
+		case protowire.BytesType:
+			v, n := protowire.ConsumeBytes(data)
+			if n < 0 {
+				return fields
+			}
+			fv.bval = append([]byte{}, v...)
+			data = data[n:]
+		default:
+			return fields
+		}
+
+		fields[int(num)] = append(fields[int(num)], fv)
+	}
+	return fields
+}
+
+func fieldValuesEqual(a, b []fieldValue) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].wireType != b[i].wireType {
+			return false
+		}
+		switch a[i].wireType {
+		case protowire.VarintType:
+			if a[i].varint != b[i].varint {
+				return false
+			}
+		case protowire.Fixed32Type:
+			if a[i].fixed32 != b[i].fixed32 {
+				return false
+			}
+		case protowire.Fixed64Type:
+			if a[i].fixed64 != b[i].fixed64 {
+				return false
+			}
+		case protowire.BytesType:
+			if !bytes.Equal(a[i].bval, b[i].bval) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func sortedFieldNums(maps ...map[int][]fieldValue) []int {
+	seen := make(map[int]bool)
+	for _, m := range maps {
+		for k := range m {
+			seen[k] = true
+		}
+	}
+	keys := make([]int, 0, len(seen))
+	for k := range seen {
+		keys = append(keys, k)
+	}
+	sort.Ints(keys)
+	return keys
+}
+
+// decodeMapEntries decodes protobuf map<string,bytes> repeated field values into a Go map.
+func decodeMapEntries(entries []fieldValue) map[string][]byte {
+	result := make(map[string][]byte)
+	for _, e := range entries {
+		if e.wireType != protowire.BytesType {
+			continue
+		}
+		fields := parseProtoFields(e.bval)
+		if keyVals, ok := fields[1]; ok && len(keyVals) > 0 && keyVals[0].wireType == protowire.BytesType {
+			key := string(keyVals[0].bval)
+			var val []byte
+			if valVals, ok := fields[2]; ok && len(valVals) > 0 && valVals[0].wireType == protowire.BytesType {
+				val = valVals[0].bval
+			}
+			result[key] = val
+		}
+	}
+	return result
+}
+
+// diffChunks compares repeated FileChunk values and returns sub-field diff names.
+func diffChunks(pgChunks, tikvChunks []fieldValue) []string {
+	var diffs []string
+
+	if len(pgChunks) != len(tikvChunks) {
+		diffs = append(diffs, fmt.Sprintf("chunks (count: pg=%d tikv=%d)", len(pgChunks), len(tikvChunks)))
+	}
+
+	minLen := len(pgChunks)
+	if len(tikvChunks) < minLen {
+		minLen = len(tikvChunks)
+	}
+
+	for i := 0; i < minLen; i++ {
+		if pgChunks[i].wireType != protowire.BytesType || tikvChunks[i].wireType != protowire.BytesType {
+			diffs = append(diffs, fmt.Sprintf("chunks[%d]", i))
+			continue
+		}
+		prefix := fmt.Sprintf("chunks[%d].", i)
+		subDiffs := diffFieldsGeneric(pgChunks[i].bval, tikvChunks[i].bval, chunkFieldNames, prefix)
+		if len(subDiffs) > 0 {
+			diffs = append(diffs, subDiffs...)
+		} else if !bytes.Equal(pgChunks[i].bval, tikvChunks[i].bval) {
+			diffs = append(diffs, fmt.Sprintf("chunks[%d] (encoding)", i))
+		}
+	}
+
+	return diffs
+}
+
+// diffExtended compares extended map<string,bytes> fields.
+func diffExtended(pgExts, tikvExts []fieldValue) []string {
+	pgMap := decodeMapEntries(pgExts)
+	tikvMap := decodeMapEntries(tikvExts)
+
+	var diffs []string
+	allKeys := make(map[string]bool)
+	for k := range pgMap {
+		allKeys[k] = true
+	}
+	for k := range tikvMap {
+		allKeys[k] = true
+	}
+
+	for k := range allKeys {
+		pgVal, pgOk := pgMap[k]
+		tikvVal, tikvOk := tikvMap[k]
+		if pgOk && tikvOk {
+			if !bytes.Equal(pgVal, tikvVal) {
+				diffs = append(diffs, fmt.Sprintf("extended[%q] (changed)", k))
+			}
+		} else if !pgOk {
+			diffs = append(diffs, fmt.Sprintf("extended[%q] (added in tikv)", k))
+		} else if !tikvOk {
+			diffs = append(diffs, fmt.Sprintf("extended[%q] (missing in tikv)", k))
+		}
+	}
+
+	sort.Strings(diffs)
+	return diffs
+}
+
+// diffFieldsGeneric compares two protobuf blobs field-by-field without recursing into sub-messages.
+func diffFieldsGeneric(pgData, tikvData []byte, nameMap map[int]string, prefix string) []string {
+	pgFields := parseProtoFields(pgData)
+	tikvFields := parseProtoFields(tikvData)
+
+	var diffs []string
+	for _, num := range sortedFieldNums(pgFields, tikvFields) {
+		name := nameMap[num]
+		if name == "" {
+			name = fmt.Sprintf("field_%d", num)
+		}
+		fullName := prefix + name
+		pgVals := pgFields[num]
+		tikvVals := tikvFields[num]
+
+		if !fieldValuesEqual(pgVals, tikvVals) {
+			// Recurse into fid/source_fid (FileId sub-message)
+			if (num == 7 || num == 8) &&
+				len(pgVals) >= 1 && len(tikvVals) >= 1 &&
+				pgVals[0].wireType == protowire.BytesType &&
+				tikvVals[0].wireType == protowire.BytesType {
+				subDiffs := diffFieldsGeneric(pgVals[0].bval, tikvVals[0].bval, fileIdFieldNames, fullName+".")
+				if len(subDiffs) > 0 {
+					diffs = append(diffs, subDiffs...)
+				} else {
+					diffs = append(diffs, fullName+" (encoding)")
+				}
+			} else {
+				diffs = append(diffs, fullName)
+			}
+		}
+	}
+	return diffs
+}
+
+// diffFields returns the names of differing protobuf fields between two Entry blobs.
+func diffFields(pgData, tikvData []byte, nameMap map[int]string, prefix string) []string {
+	pgFields := parseProtoFields(pgData)
+	tikvFields := parseProtoFields(tikvData)
+
+	var diffs []string
+	for _, num := range sortedFieldNums(pgFields, tikvFields) {
+		name := nameMap[num]
+		if name == "" {
+			name = fmt.Sprintf("field_%d", num)
+		}
+		fullName := prefix + name
+		pgVals := pgFields[num]
+		tikvVals := tikvFields[num]
+
+		if !fieldValuesEqual(pgVals, tikvVals) {
+			switch {
+			// Recurse into attributes (Entry field 3)
+			case prefix == "" && num == 3 &&
+				len(pgVals) >= 1 && len(tikvVals) >= 1 &&
+				pgVals[0].wireType == protowire.BytesType &&
+				tikvVals[0].wireType == protowire.BytesType:
+				subDiffs := diffFields(pgVals[0].bval, tikvVals[0].bval, attrFieldNames, "attributes.")
+				if len(subDiffs) > 0 {
+					diffs = append(diffs, subDiffs...)
+				} else {
+					diffs = append(diffs, fullName+" (encoding)")
+				}
+
+			// Recurse into chunks (Entry field 4, repeated FileChunk)
+			case prefix == "" && num == 4:
+				diffs = append(diffs, diffChunks(pgVals, tikvVals)...)
+
+			// Decode extended (Entry field 5, map<string,bytes>)
+			case prefix == "" && num == 5:
+				diffs = append(diffs, diffExtended(pgVals, tikvVals)...)
+
+			default:
+				diffs = append(diffs, fullName)
+			}
+		}
+	}
+	sort.Strings(diffs)
+	return diffs
+}
+
+func formatValues(vals []fieldValue) string {
+	if len(vals) == 0 {
+		return "<absent>"
+	}
+	parts := make([]string, len(vals))
+	for i, v := range vals {
+		switch v.wireType {
+		case protowire.VarintType:
+			parts[i] = fmt.Sprintf("%d", v.varint)
+		case protowire.Fixed32Type:
+			parts[i] = fmt.Sprintf("0x%08x", v.fixed32)
+		case protowire.Fixed64Type:
+			parts[i] = fmt.Sprintf("%d", v.fixed64)
+		case protowire.BytesType:
+			if len(v.bval) <= 64 && isPrintable(v.bval) {
+				parts[i] = fmt.Sprintf("%q", string(v.bval))
+			} else if len(v.bval) <= 32 {
+				parts[i] = fmt.Sprintf("%x", v.bval)
+			} else {
+				parts[i] = fmt.Sprintf("(%d bytes)", len(v.bval))
+			}
+		}
+	}
+	if len(parts) == 1 {
+		return parts[0]
+	}
+	return "[" + strings.Join(parts, ", ") + "]"
+}
+
+func isPrintable(b []byte) bool {
+	for _, c := range b {
+		if c < 0x20 || c > 0x7e {
+			return false
+		}
+	}
+	return len(b) > 0
+}
+
+func formatValuesNamed(fullName string, vals []fieldValue) string {
+	if len(vals) == 0 {
+		return "<absent>"
+	}
+	// Check if this is a seconds-based timestamp
+	baseName := fullName
+	if idx := strings.LastIndex(fullName, "."); idx >= 0 {
+		baseName = fullName[idx+1:]
+	}
+	if secondTimestampFields[fullName] && len(vals) == 1 && vals[0].wireType == protowire.VarintType {
+		ts := int64(vals[0].varint)
+		t := time.Unix(ts, 0).UTC()
+		return fmt.Sprintf("%d (%s)", ts, t.Format("2006-01-02T15:04:05Z"))
+	}
+	if nanoTimestampFields[baseName] && len(vals) == 1 && vals[0].wireType == protowire.VarintType {
+		ns := int64(vals[0].varint)
+		t := time.Unix(0, ns).UTC()
+		return fmt.Sprintf("%d (%s)", ns, t.Format("2006-01-02T15:04:05.000Z"))
+	}
+	return formatValues(vals)
+}
+
+// detailedFieldDiff returns verbose diff lines with actual values.
+func detailedFieldDiff(pgData, tikvData []byte) []string {
+	pgEntry := parseProtoFields(pgData)
+	tikvEntry := parseProtoFields(tikvData)
+
+	var lines []string
+
+	// --- Attributes sub-fields ---
+	var pgAttr, tikvAttr map[int][]fieldValue
+	if vals, ok := pgEntry[3]; ok && len(vals) >= 1 && vals[0].wireType == protowire.BytesType {
+		pgAttr = parseProtoFields(vals[0].bval)
+	}
+	if vals, ok := tikvEntry[3]; ok && len(vals) >= 1 && vals[0].wireType == protowire.BytesType {
+		tikvAttr = parseProtoFields(vals[0].bval)
+	}
+	if pgAttr != nil || tikvAttr != nil {
+		if pgAttr == nil {
+			pgAttr = make(map[int][]fieldValue)
+		}
+		if tikvAttr == nil {
+			tikvAttr = make(map[int][]fieldValue)
+		}
+		for _, num := range sortedFieldNums(pgAttr, tikvAttr) {
+			name := attrFieldNames[num]
+			if name == "" {
+				name = fmt.Sprintf("field_%d", num)
+			}
+			fullName := "attributes." + name
+			pgVals := pgAttr[num]
+			tikvVals := tikvAttr[num]
+			if !fieldValuesEqual(pgVals, tikvVals) {
+				pgStr := formatValuesNamed(fullName, pgVals)
+				tikvStr := formatValuesNamed(fullName, tikvVals)
+				lines = append(lines, fmt.Sprintf("  %s: pg=%s tikv=%s", fullName, pgStr, tikvStr))
+			}
+		}
+	}
+
+	// --- Chunks sub-fields ---
+	pgChunks := pgEntry[4]
+	tikvChunks := tikvEntry[4]
+	if len(pgChunks) != len(tikvChunks) {
+		lines = append(lines, fmt.Sprintf("  chunks count: pg=%d tikv=%d", len(pgChunks), len(tikvChunks)))
+	}
+	minChunks := len(pgChunks)
+	if len(tikvChunks) < minChunks {
+		minChunks = len(tikvChunks)
+	}
+	for i := 0; i < minChunks; i++ {
+		if pgChunks[i].wireType != protowire.BytesType || tikvChunks[i].wireType != protowire.BytesType {
+			continue
+		}
+		pgCF := parseProtoFields(pgChunks[i].bval)
+		tikvCF := parseProtoFields(tikvChunks[i].bval)
+		for _, num := range sortedFieldNums(pgCF, tikvCF) {
+			name := chunkFieldNames[num]
+			if name == "" {
+				name = fmt.Sprintf("field_%d", num)
+			}
+			fullName := fmt.Sprintf("chunks[%d].%s", i, name)
+			pgVals := pgCF[num]
+			tikvVals := tikvCF[num]
+			if !fieldValuesEqual(pgVals, tikvVals) {
+				// For fid/source_fid, decode the FileId
+				if (num == 7 || num == 8) && len(pgVals) >= 1 && len(tikvVals) >= 1 &&
+					pgVals[0].wireType == protowire.BytesType && tikvVals[0].wireType == protowire.BytesType {
+					lines = append(lines, formatFileIdDiff(fullName, pgVals[0].bval, tikvVals[0].bval)...)
+				} else {
+					pgStr := formatValuesNamed(fullName, pgVals)
+					tikvStr := formatValuesNamed(fullName, tikvVals)
+					lines = append(lines, fmt.Sprintf("  %s: pg=%s tikv=%s", fullName, pgStr, tikvStr))
+				}
+			}
+		}
+	}
+
+	// --- Extended map entries ---
+	pgExts := pgEntry[5]
+	tikvExts := tikvEntry[5]
+	pgMap := decodeMapEntries(pgExts)
+	tikvMap := decodeMapEntries(tikvExts)
+	allExtKeys := make(map[string]bool)
+	for k := range pgMap {
+		allExtKeys[k] = true
+	}
+	for k := range tikvMap {
+		allExtKeys[k] = true
+	}
+	for k := range allExtKeys {
+		pgVal, pgOk := pgMap[k]
+		tikvVal, tikvOk := tikvMap[k]
+		if pgOk && tikvOk {
+			if !bytes.Equal(pgVal, tikvVal) {
+				lines = append(lines, fmt.Sprintf("  extended[%q]: pg=%q tikv=%q", k, pgVal, tikvVal))
+			}
+		} else if !pgOk {
+			lines = append(lines, fmt.Sprintf("  extended[%q]: pg=<absent> tikv=%q", k, tikvVal))
+		} else {
+			lines = append(lines, fmt.Sprintf("  extended[%q]: pg=%q tikv=<absent>", k, pgVal))
+		}
+	}
+
+	// --- Other top-level fields (skip 3, 4, 5 handled above) ---
+	for _, num := range sortedFieldNums(pgEntry, tikvEntry) {
+		if num == 3 || num == 4 || num == 5 {
+			continue
+		}
+		name := entryFieldNames[num]
+		if name == "" {
+			name = fmt.Sprintf("field_%d", num)
+		}
+		pgVals := pgEntry[num]
+		tikvVals := tikvEntry[num]
+		if !fieldValuesEqual(pgVals, tikvVals) {
+			lines = append(lines, fmt.Sprintf("  %s: pg=%s tikv=%s",
+				name, formatValues(pgVals), formatValues(tikvVals)))
+		}
+	}
+
+	return lines
+}
+
+func formatFileIdDiff(prefix string, pgFid, tikvFid []byte) []string {
+	pgFields := parseProtoFields(pgFid)
+	tikvFields := parseProtoFields(tikvFid)
+	var lines []string
+	for _, num := range sortedFieldNums(pgFields, tikvFields) {
+		name := fileIdFieldNames[num]
+		if name == "" {
+			name = fmt.Sprintf("field_%d", num)
+		}
+		fullName := prefix + "." + name
+		if !fieldValuesEqual(pgFields[num], tikvFields[num]) {
+			lines = append(lines, fmt.Sprintf("  %s: pg=%s tikv=%s",
+				fullName, formatValues(pgFields[num]), formatValues(tikvFields[num])))
+		}
+	}
+	return lines
+}
+
 func compareMeta(pg, tikv []byte) string {
 	if len(pg) != len(tikv) {
 		return fmt.Sprintf("length differs: pg=%d tikv=%d", len(pg), len(tikv))
 	}
 
-	// Find first differing byte
 	firstDiff := -1
 	diffCount := 0
 	for i := 0; i < len(pg); i++ {
@@ -176,7 +682,6 @@ func compareMeta(pg, tikv []byte) string {
 		return "identical (false positive?)"
 	}
 
-	// Show context around first difference
 	start := firstDiff - 8
 	if start < 0 {
 		start = 0
@@ -371,6 +876,10 @@ func main() {
 	var checked, found, matched, missing, mismatched int64
 	startTime := time.Now()
 
+	// Mismatch field tracking (only written by single collector goroutine)
+	mismatchFieldCounts := make(map[string]int)
+	mismatchPatternCounts := make(map[string]int)
+
 	// Result collector
 	var collectorWg sync.WaitGroup
 	collectorWg.Add(1)
@@ -384,14 +893,26 @@ func main() {
 					atomic.AddInt64(&matched, 1)
 				} else {
 					m := atomic.AddInt64(&mismatched, 1)
+
+					// Analyze which protobuf fields differ
+					diffs := diffFields(result.Entry.Meta, result.TiKVMeta, entryFieldNames, "")
+					pattern := strings.Join(diffs, ", ")
+					if pattern == "" {
+						pattern = "(encoding only)"
+					}
+					mismatchPatternCounts[pattern]++
+					for _, d := range diffs {
+						mismatchFieldCounts[d]++
+					}
+
 					if *showMissing {
 						if *verbose {
-							log.Printf("MISMATCH #%d: %s%s", m, result.Entry.Directory, result.Entry.Name)
-							log.Printf("  Details: %s", compareMeta(result.Entry.Meta, result.TiKVMeta))
+							log.Printf("MISMATCH #%d: %s%s [%s]", m, result.Entry.Directory, result.Entry.Name, pattern)
+							for _, line := range detailedFieldDiff(result.Entry.Meta, result.TiKVMeta) {
+								log.Print(line)
+							}
 						} else {
-							log.Printf("MISMATCH: %s%s (pg_meta_len=%d, tikv_meta_len=%d)",
-								result.Entry.Directory, result.Entry.Name,
-								len(result.Entry.Meta), len(result.TiKVMeta))
+							log.Printf("MISMATCH #%d: %s%s [%s]", m, result.Entry.Directory, result.Entry.Name, pattern)
 						}
 					}
 					if *maxMismatches > 0 && m >= int64(*maxMismatches) {
@@ -420,7 +941,6 @@ func main() {
 	// Table name has been validated against SQL injection
 	var query string
 	if *mode == "sample" {
-		// Random sample using ORDER BY RANDOM()
 		query = fmt.Sprintf(`
 			SELECT dirhash, directory, name, meta
 			FROM %q
@@ -429,7 +949,6 @@ func main() {
 			*table, *sampleSize)
 		log.Printf("Running random sample of %d rows...", *sampleSize)
 	} else {
-		// Complete scan
 		query = fmt.Sprintf(`
 			SELECT dirhash, directory, name, meta
 			FROM %q
@@ -481,6 +1000,40 @@ func main() {
 	} else {
 		log.Printf("No rows checked - nothing to report")
 	}
+
+	// Mismatch field analysis summary
+	if finalMismatched > 0 {
+		log.Println()
+		log.Println("=== Mismatch Analysis ===")
+
+		type kv struct {
+			name  string
+			count int
+		}
+
+		var fields []kv
+		for name, count := range mismatchFieldCounts {
+			fields = append(fields, kv{name, count})
+		}
+		sort.Slice(fields, func(i, j int) bool { return fields[i].count > fields[j].count })
+
+		log.Println("Differing fields:")
+		for _, f := range fields {
+			log.Printf("  %-50s %d entries", f.name, f.count)
+		}
+
+		var patterns []kv
+		for pattern, count := range mismatchPatternCounts {
+			patterns = append(patterns, kv{pattern, count})
+		}
+		sort.Slice(patterns, func(i, j int) bool { return patterns[i].count > patterns[j].count })
+
+		log.Println("Mismatch patterns:")
+		for _, p := range patterns {
+			log.Printf("  [%s]  %d entries", p.name, p.count)
+		}
+	}
+
 	log.Printf("Time: %v", elapsed.Round(time.Second))
 	log.Printf("seaweed-pg2tikv-audit version %s", Version)
 

@@ -2,6 +2,46 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.4] - 2026-03-07
+
+### Features
+- Added `--version` flag and startup banner showing version number for easy binary identification
+
+Agent: Claude Code (Claude:Opus 4.6)
+
+## [1.2.3] - 2026-03-07
+
+### Features
+- **Orphan migration via gRPC:** Added `--migrate` flag to move root-level orphan entries (files with no bucket copy) into the correct S3 buckets. Uses SeaweedFS filer gRPC `CreateEntry` API to create metadata at the bucket path with the same chunks, then removes root metadata with `skipChunkDeletion=true`. Extension-to-bucket mapping: `.heic`→rootseek-heic, `.json.gz`→rootseek-ocr, `.lp_newspaper`→rootseek-newspaper, `.jp2`→rootseek-jp2, `.parquet`→rootseek-fast-parquet.
+- **Migration safety check:** Pre-flight test migrates one orphan file, verifies it's readable at the bucket path, deletes the root copy, and confirms the bucket copy survives.
+- **Combined modes:** `--delete` and `--migrate` can be used together to handle both duplicates and orphans in a single pass.
+- Added compiled SeaweedFS filer gRPC proto stubs (`filer_pb2.py`, `filer_pb2_grpc.py`) and source proto.
+- Auto-derives filer gRPC address from HTTP URL (port+10000), overridable with `--filer-grpc`.
+
+Agent: Claude Code (Claude:Opus 4.6)
+
+## [1.2.2] - 2026-03-06
+
+### Features
+- **Deep protobuf mismatch analysis:** Audit now recursively decodes chunks (FileChunk sub-fields: file_id, fid, offset, size, modified_ts_ns) and extended map entries (key-value pairs like Seaweed-X-Amz-Implicit-Dir) to show exactly what differs
+- Chunks show sub-field diffs like `chunks[0].fid.volume_id`, `chunks[0].modified_ts_ns`
+- Extended entries show readable keys: `extended["Seaweed-X-Amz-Implicit-Dir"] (added in tikv)`
+- FileId sub-messages (volume_id, file_key, cookie) decoded within chunk fid/source_fid fields
+- Nanosecond timestamps (modified_ts_ns) formatted as ISO 8601
+
+Agent: Claude Code (Claude:Opus 4.6)
+
+## [1.2.1] - 2026-03-06
+
+### Features
+- **Audit mismatch analysis:** Audit now decodes protobuf fields to identify exactly which SeaweedFS Entry fields differ between Postgres and TiKV (e.g., attributes.mtime, attributes.crtime, chunks, file_size)
+- Mismatch summary always printed at end showing differing fields and their frequency
+- Mismatch patterns show which combinations of fields differ together
+- `--show-missing` now shows field names that differ per entry (e.g., `MISMATCH #1: /path/file.jpg [attributes.mtime, attributes.crtime]`)
+- `--verbose` now shows actual field values with timestamps formatted as ISO 8601
+
+Agent: Claude Code (Claude:Opus 4.6)
+
 ## [1.2.0] - 2026-02-19
 
 ### Bug Fixes
