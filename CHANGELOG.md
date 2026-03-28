@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.7] - 2026-03-27
+
+### Tests
+- Added unit tests for all three binaries (39 test cases total): main.go (16 tests), audit.go (19 tests), count_keys.go (3 tests + property test)
+- Covers critical paths: TiKV key generation, path prefix handling (prior production bug site), SQL injection prevention, state save/load with old format migration, ProgressTracker (sequential, out-of-order, failure, concurrent), protobuf parsing, audit field diffing, key range prefix end calculation
+- Run per-binary: `go test -v main.go main_test.go`, `go test -v audit.go audit_test.go`, `go test -v count_keys.go count_keys_test.go`
+
+Agent: Claude Code (Claude:Opus 4.6)
+
 ## [1.2.6] - 2026-03-07
 
 ### Features
